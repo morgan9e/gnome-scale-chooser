@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+
+import subprocess
+import sys
+import re
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw  # noqa: E402
+
+MONITORS_XML = Path(f"{Path.home()}/.config/monitors.xml")
+
+def find_safe_scales(pw, ph, max_denom=24):
+    divs_of_120 = [d for d in range(1, max_denom + 1) if 120 % d == 0]
+    scales = set()
+    for denom in divs_of_120:
+        for numer in range(denom, denom * 4 + 1):
+            s = numer / denom
+            if s < 1.0 or s > 4.0:
+                continue
+            if pw / s == int(pw / s) and ph / s == int(ph / s):
+                n120 = round(s * 120)
+                if abs(n120 / 120 - s) < 1e-9:
+                    scales.add(s)
+    return sorted(scales)
+
+def get_active_connector():
+    out = subprocess.run(
+        [
+            "gdbus", "call", "--session",
+            "--dest", "org.gnome.Mutter.DisplayConfig",
+            "--object-path", "/org/gnome/Mutter/DisplayConfig",
+            "--method", "org.gnome.Mutter.DisplayConfig.GetCurrentState"
+        ],
+        capture_output=True, text=True).stdout
+    m = re.search(r"'((?:DP|HDMI|eDP|VGA|Meta)-\d+)'", out)
+    return m.group(1) if m else None
+
+def parse_current_config():
+    active = get_active_connector()
+    tree = ET.parse(MONITORS_XML)
+    for conf in tree.getroot().findall("configuration"):
+        for lm in conf.findall("logicalmonitor"):
+            mon = lm.find("monitor")
+            if mon is None:
+                continue
+            spec = mon.find("monitorspec")
+            mode = mon.find("mode")
+            if spec is None or mode is None:
+                continue
+            connector = spec.findtext("connector", "")
+            if active and connector != active:
+                continue
+            pw = int(mode.findtext("width", "0"))
+            ph = int(mode.findtext("height", "0"))
+            scale = float(lm.findtext("scale", "1"))
+            lms = []
+            for c2 in tree.getroot().findall("configuration"):
+                for lm2 in c2.findall("logicalmonitor"):
+                    m2 = lm2.find("monitor")
+                    if m2 is None:
+                        continue
+                    s2 = m2.find("monitorspec")
+                    d2 = m2.find("mode")
+                    if s2 is None or d2 is None:
+                        continue
+                    if (s2.findtext("connector", "") == connector and
+                            int(d2.findtext("width", "0")) == pw and
+                            int(d2.findtext("height", "0")) == ph):
+                        lms.append(lm2)
+            return connector, pw, ph, scale, lms, tree
+    return None
+
+def apply_scale(lms, tree, new_scale):
+    for lm in lms:
+        elem = lm.find("scale")
+        if elem is None:
+            elem = ET.SubElement(lm, "scale")
+        elem.text = str(new_scale)
+    ET.indent(tree, space="    ")
+    tree.write(MONITORS_XML, xml_declaration=True, encoding="unicode")
+
+class App(Adw.Application):
+    def __init__(self, connector, pw, ph, cur_scale, scales, lms, tree):
+        super().__init__(application_id="org.gnome.scale-chooser")
+        self.connector, self.pw, self.ph = connector, pw, ph
+        self.cur_scale, self.scales = cur_scale, scales
+        self.lms, self.tree = lms, tree
+
+    def do_activate(self):
+        win = Adw.ApplicationWindow(application=self)
+        win.set_default_size(360, 600)
+        win.set_title("Scale")
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(
+            title=f"{self.connector}",
+            subtitle=f"{self.pw}×{self.ph}"))
+        toolbar.add_top_bar(header)
+        win.set_content(toolbar)
+
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        scroll.set_margin_top(8)
+        scroll.set_margin_bottom(8)
+        scroll.set_margin_start(12)
+        scroll.set_margin_end(12)
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_css_classes(["boxed-list"])
+        self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        scroll.set_child(self.listbox)
+        toolbar.set_content(scroll)
+
+        for s in self.scales:
+            lw, lh = int(self.pw / s), int(self.ph / s)
+            pct = s * 100
+            is_cur = abs(s - self.cur_scale) < 0.001
+
+            row = Adw.ActionRow()
+            row.set_title(f"{pct:.4g}%")
+            row.set_subtitle(f"{lw}×{lh}")
+            if is_cur:
+                check = Gtk.Image.new_from_icon_name("checkmark-symbolic")
+                row.add_suffix(check)
+            row._scale = s
+            self.listbox.append(row)
+            if is_cur:
+                self.listbox.select_row(row)
+
+        btn = Gtk.Button(label="Apply")
+        btn.add_css_class("suggested-action")
+        btn.add_css_class("pill")
+        btn.set_margin_start(24)
+        btn.set_margin_end(24)
+        btn.set_margin_bottom(12)
+        btn.connect("clicked", self._apply)
+        toolbar.add_bottom_bar(btn)
+
+        win.present()
+
+    def _apply(self, btn):
+        row = self.listbox.get_selected_row()
+        if not row:
+            return
+        apply_scale(self.lms, self.tree, row._scale)
+        d = Adw.AlertDialog(heading="Applied",
+                            body="Log out and back in to apply.")
+        d.add_response("ok", "OK")
+        d.present(btn.get_root())
+
+def main():
+    if not MONITORS_XML.exists():
+        print(f"Not found: {MONITORS_XML}"); sys.exit(1)
+
+    result = parse_current_config()
+    if not result:
+        print("No matching config found"); sys.exit(1)
+    connector, pw, ph, cur_scale, lms, tree = result
+    scales = find_safe_scales(pw, ph)
+
+    if "--cli" in sys.argv:
+        for i, s in enumerate(scales):
+            lw, lh = int(pw / s), int(ph / s)
+            pct = s * 100
+            cur = " *" if abs(s - cur_scale) < 0.001 else ""
+            print(f"  {i:2d}) {pct:>7.4g}%  {lw}×{lh}{cur}")
+        choice = input("\? ").strip()
+        if choice:
+            apply_scale(lms, tree, scales[int(choice)])
+            print("Done")
+    else:
+        App(connector, pw, ph, cur_scale, scales, lms, tree).run([])
+
+if __name__ == "__main__":
+    main()
